@@ -1,0 +1,24 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UserSecretsId>5387a67e-c4a8-4004-aaa2-bed5e20c60eb</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+		<PackageReference Include="AngleSharp.Js" Version="0.15.0" />
+		<PackageReference Include="Microsoft.Extensions.Configuration" Version="9.0.7" />
+		<PackageReference Include="Microsoft.Extensions.Configuration.UserSecrets" Version="9.0.7" />
+		<PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.7" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AIAgentOrchestration.Assistant\AIAgentOrchestration.Assistant.csproj" />
+    <ProjectReference Include="..\AIAgentOrchestration.Developer\AIAgentOrchestration.Developer.csproj" />
+    <ProjectReference Include="..\AIAgentOrchestration.Orchestrator\AIAgentOrchestration.Orchestrator.csproj" />
+  </ItemGroup>
+
+</Project>
