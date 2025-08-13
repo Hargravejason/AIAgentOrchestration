@@ -23,14 +23,36 @@ public record RetrievedDoc(
   public double BM25 { get; set; }                        // raw ft rank, normalize later
 }
 
-public record RankedDoc(
-    Guid Id,
+public sealed record RetrievedChunk(
+    Guid DocId,
+    Guid ChunkId,
     string Title,
     string Snippet,
-    double FinalScore,
+    int? PageNumber,                      // optional
+    double DenseScore,                    // ∈ [0,1]
+    double BM25,                          // raw; will normalize
     bool IsFaq,
     IReadOnlyCollection<string> Tags
 );
+
+public sealed record RankedChunk(
+    Guid DocId,
+    Guid ChunkId,
+    string Title,
+    string Snippet,
+    double FusedScore,
+    bool PhraseHit
+);
+
+public sealed record RankedDoc(
+    Guid DocId,
+    string Title,
+    double DocScore,
+    bool IsFaq,
+    IReadOnlyCollection<string> Tags,
+    IReadOnlyList<RankedChunk> TopChunks   // chunks you’ll pass to the LLM
+);
+
 
 public record RetrievalResult(
     IReadOnlyList<RankedDoc> TopDocs,
@@ -134,52 +156,128 @@ public class HybridRAGModel
     return r;
   }
 
-  IReadOnlyList<RetrievedDoc> MergeDedup(IReadOnlyList<RetrievedDoc> bm25, IReadOnlyList<RetrievedDoc> dense)
+  IReadOnlyList<RetrievedChunk> MergeByChunkId(IList<RetrievedChunk> bm25, IList<RetrievedChunk> dense)
   {
-    // Dedup by Id, combine available scores; retain order lists for RRF later
-    var byId = new Dictionary<Guid, RetrievedDoc>();
-    foreach (var d in dense) byId[d.Id] = d;
+    var byChunk = new Dictionary<Guid, RetrievedChunk>();
+
+    // Prefer to seed with dense side (keeps DenseScore), but either order works.
+    foreach (var d in dense)
+      byChunk[d.ChunkId] = d;
+
     foreach (var b in bm25)
     {
-      if (byId.TryGetValue(b.Id, out var ex))
-        byId[b.Id] = ex with { BM25 = Math.Max(ex.BM25, b.BM25) };
+      if (byChunk.TryGetValue(b.ChunkId, out var ex))
+      {
+        // keep the best of each score dimension
+        byChunk[b.ChunkId] = ex with { BM25 = Math.Max(ex.BM25, b.BM25) };
+      }
       else
-        byId[b.Id] = b;
+      {
+        byChunk[b.ChunkId] = b;
+      }
     }
-    return byId.Values.ToList();
+
+    return byChunk.Values.ToList();
   }
 
-  IReadOnlyList<RankedDoc> ScoreAndRank(string userQuery, string[] queryVariants, IReadOnlyList<RetrievedDoc> candidates)
+  static void NormalizeBm25(IList<RetrievedChunk> chunks)
+  {
+    var max = chunks.Count == 0 ? 1.0 : chunks.Max(c => c.BM25);
+    if (max <= 0) max = 1.0;
+    for (int i = 0; i < chunks.Count; i++)
+      chunks[i] = chunks[i] with { BM25 = Math.Min(1.0, chunks[i].BM25 / max) };
+  }
+
+  static double FusedChunkScore(RetrievedChunk c, bool phraseHit,
+                                double wDense = 0.55, double wBm25 = 0.35, double wPhrase = 0.25, double wTag = 0.15)
+  {
+    var tagPrior = c.IsFaq ? wTag : 0.0;
+    return wDense * c.DenseScore
+         + wBm25 * c.BM25
+         + (phraseHit ? wPhrase : 0.0)
+         + tagPrior;
+  }
+
+  // Smooth max over top-k chunks: tau higher → closer to max
+  static double SmoothMax(IEnumerable<double> xs, double tau = 8.0)
+  {
+    var arr = xs as double[] ?? xs.ToArray();
+    if (arr.Length == 0) return 0.0;
+    var m = arr.Max();
+    var sum = 0.0;
+    foreach (var x in arr) sum += Math.Exp(tau * (x - m));
+    return m + Math.Log(sum) / tau;
+  }
+
+  IReadOnlyList<RankedDoc> ScoreChunksAndAggregateDocs(
+      string userQuery,
+      string[] queryVariants,
+      IReadOnlyList<RetrievedChunk> candidates,
+      int topPerDoc = 3,
+      double tau = 8.0) // for SmoothMax
   {
     if (candidates.Count == 0) return Array.Empty<RankedDoc>();
 
-    NormalizeBm25((IList<RetrievedDoc>)candidates);
+    NormalizeBm25((IList<RetrievedChunk>)candidates);
 
     var phraseQ = queryVariants.FirstOrDefault(v => v.StartsWith("\"") && v.EndsWith("\""))
                   ?? $"\"{userQuery}\"";
+    var phrase = phraseQ.Trim('"');
 
-    var denseOrder = candidates.OrderByDescending(d => d.DenseScore).ToList();
-    var bm25Order = candidates.OrderByDescending(d => d.BM25).ToList();
-    var rrf = RrfScores(denseOrder, bm25Order);
-
-    var ranked = new List<RankedDoc>(candidates.Count);
+    // 1) Compute chunk-level fused scores
+    var rankedChunks = new List<RankedChunk>(candidates.Count);
     foreach (var c in candidates)
     {
-      var phraseBonus = PhraseHit(TrimQuotes(phraseQ), c) ? RetrievalCfg.WPhrase : 0.0;
-      var tagPrior = c.IsFaq ? RetrievalCfg.WTag : 0.0;
+      bool phraseHit = (!string.IsNullOrEmpty(phrase) &&
+         (c.Title?.IndexOf(phrase, StringComparison.OrdinalIgnoreCase) >= 0 ||
+          c.Snippet?.IndexOf(phrase, StringComparison.OrdinalIgnoreCase) >= 0));
 
-      var fused = RetrievalCfg.WDense * c.DenseScore
-                + RetrievalCfg.WBm25 * c.BM25
-                + phraseBonus
-                + tagPrior
-                + 0.05 * rrf.GetValueOrDefault(c.Id); // small weight on RRF signal
-
-      ranked.Add(new RankedDoc(
-          c.Id, c.Title, c.Snippet, FinalScore: fused, c.IsFaq, c.Tags));
+      var fused = FusedChunkScore(c, phraseHit);
+      rankedChunks.Add(new RankedChunk(c.DocId, c.ChunkId, c.Title, c.Snippet, fused, phraseHit));
     }
 
-    return ranked.OrderByDescending(r => r.FinalScore).ToList();
+    // 2) Group by doc and aggregate top-k chunks per doc
+    var byDoc = rankedChunks
+        .GroupBy(rc => rc.DocId)
+        .Select(g =>
+        {
+          // Top-k chunks per doc
+          var topK = g.OrderByDescending(x => x.FusedScore).Take(topPerDoc).ToList();
+
+          // SmoothMax pooling of their fused scores
+          var pooled = SmoothMax(topK.Select(x => x.FusedScore), tau);
+
+          // Multi-hit bonus: small boost per extra good chunk
+          // (tune 0.03, cap 0.12)
+          var multiHitBonus = Math.Min(0.12, 0.03 * Math.Max(0, topK.Count - 1));
+
+          // Phrase doc bonus: if any top chunk had a phrase hit, add tiny doc-level nudge
+          var anyPhrase = topK.Any(x => x.PhraseHit);
+          var docPhraseBonus = anyPhrase ? 0.05 : 0.0;
+
+          var docScore = pooled + multiHitBonus + docPhraseBonus;
+
+          // Pick a title/snippet (from best chunk)
+          var best = topK[0];
+
+          // We need IsFaq/Tags; carry them by looking back to any candidate from this doc
+          var sample = candidates.First(c => c.ChunkId == best.ChunkId);
+
+          return new RankedDoc(
+              DocId: g.Key,
+              Title: best.Title,
+              DocScore: docScore,
+              IsFaq: sample.IsFaq,
+              Tags: sample.Tags,
+              TopChunks: topK
+          );
+        })
+        .OrderByDescending(d => d.DocScore)
+        .ToList();
+
+    return byDoc;
   }
+
 
   string TrimQuotes(string s) => s.Trim().Trim('"');
 
