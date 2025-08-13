@@ -434,3 +434,96 @@ public class HybridRAGModel
 
   #endregion
 }
+
+
+public sealed class ContextPacker
+{
+  public int BudgetTokens { get; }
+  public int MaxDocs { get; }
+  public int MaxChunksPerDoc { get; }
+
+  public ContextPacker(int budgetTokens = 1800, int maxDocs = 4, int maxChunksPerDoc = 3)
+  {
+    BudgetTokens = budgetTokens;
+    MaxDocs = maxDocs;
+    MaxChunksPerDoc = maxChunksPerDoc;
+  }
+
+  public IReadOnlyList<(Guid DocId, Guid ChunkId, string PackedText)> Pack(
+      IReadOnlyList<RankedDoc> rankedDocs, string userQuery)
+  {
+    var packed = new List<(Guid, Guid, string)>();
+    int used = 0;
+
+    foreach (var doc in rankedDocs.Take(MaxDocs))
+    {
+      int added = 0;
+      foreach (var ch in doc.TopChunks.OrderByDescending(c => c.FusedScore))
+      {
+        if (added >= MaxChunksPerDoc) break;
+
+        var txt = BuildWindow(userQuery, ch.Snippet, windowChars: 900); // ~200 tokens
+        if (string.IsNullOrWhiteSpace(txt)) continue;
+
+        int t = EstimateTokens(txt);
+        if (used + t > BudgetTokens) return packed;
+
+        packed.Add((doc.DocId, ch.ChunkId, txt));
+        used += t;
+        added++;
+      }
+    }
+    return packed;
+  }
+
+  // ~very rough token estimate: chars/4 (tweak per model)
+  private static int EstimateTokens(string s) => Math.Max(1, s.Length / 4);
+
+  // Grab sentences near keyword hits; fallback to head of snippet
+  private static string BuildWindow(string query, string snippet, int windowChars)
+  {
+    if (string.IsNullOrEmpty(snippet)) return "";
+    var sentences = Regex.Split(snippet, @"(?<=[\.!\?])\s+");
+    var qTerms = Regex.Matches(query.ToLowerInvariant(), @"\b\w+\b").Select(m => m.Value).ToHashSet();
+
+    // Score sentences by keyword overlap
+    var scored = sentences.Select((s, i) => new {
+      i,
+      s,
+      score = ScoreSentence(s, qTerms)
+    }).OrderByDescending(x => x.score).ToList();
+
+    var pick = new List<string>();
+    int total = 0;
+
+    // Take best sentence and its neighbors to form a small window
+    foreach (var top in scored.Take(1))
+    {
+      for (int j = Math.Max(0, top.i - 1); j <= Math.Min(sentences.Length - 1, top.i + 1); j++)
+      {
+        var seg = sentences[j].Trim();
+        if (string.IsNullOrEmpty(seg)) continue;
+        if (total + seg.Length > windowChars) break;
+        pick.Add(seg);
+        total += seg.Length + 1;
+      }
+      if (pick.Count > 0) break;
+    }
+
+    // Fallback if no overlap
+    if (pick.Count == 0)
+    {
+      var head = string.Concat(snippet.Take(windowChars));
+      return head.Trim();
+    }
+
+    return string.Join(" ", pick).Trim();
+  }
+
+  private static int ScoreSentence(string s, HashSet<string> qTerms)
+  {
+    var toks = Regex.Matches(s.ToLowerInvariant(), @"\b\w+\b").Select(m => m.Value);
+    int hits = 0; foreach (var t in toks) if (qTerms.Contains(t)) hits++;
+    return hits;
+  }
+}
