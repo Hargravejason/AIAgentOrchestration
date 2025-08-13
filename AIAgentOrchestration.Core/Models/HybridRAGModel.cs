@@ -480,45 +480,118 @@ public sealed class ContextPacker
   private static int EstimateTokens(string s) => Math.Max(1, s.Length / 4);
 
   // Grab sentences near keyword hits; fallback to head of snippet
-  private static string BuildWindow(string query, string snippet, int windowChars)
+  // === Replace your BuildWindow with this pair ===
+
+  static bool IsHeaderLike(string s)
   {
-    if (string.IsNullOrEmpty(snippet)) return "";
-    var sentences = Regex.Split(snippet, @"(?<=[\.!\?])\s+");
-    var qTerms = Regex.Matches(query.ToLowerInvariant(), @"\b\w+\b").Select(m => m.Value).ToHashSet();
+    if (string.IsNullOrWhiteSpace(s)) return false;
+    var trimmed = s.Trim();
 
-    // Score sentences by keyword overlap
-    var scored = sentences.Select((s, i) => new {
-      i,
-      s,
-      score = ScoreSentence(s, qTerms)
-    }).OrderByDescending(x => x.score).ToList();
+    // short line, ends with ":" or all caps or Title Case → header-ish
+    bool veryShort = trimmed.Length <= 80;
+    bool endsColon = trimmed.EndsWith(":") || trimmed.EndsWith("?");
+    bool manyCaps = trimmed.Count(char.IsUpper) >= Math.Max(6, trimmed.Length / 2);
+    bool titleCase = Regex.IsMatch(trimmed, @"^([A-Z][a-z]+)(\s+[A-Z][a-z]+){0,6}\s*:?$");
 
-    var pick = new List<string>();
-    int total = 0;
+    // bullets/numbering
+    bool bullet = Regex.IsMatch(trimmed, @"^(\d+\.|\-|\u2022)\s");
 
-    // Take best sentence and its neighbors to form a small window
-    foreach (var top in scored.Take(1))
-    {
-      for (int j = Math.Max(0, top.i - 1); j <= Math.Min(sentences.Length - 1, top.i + 1); j++)
-      {
-        var seg = sentences[j].Trim();
-        if (string.IsNullOrEmpty(seg)) continue;
-        if (total + seg.Length > windowChars) break;
-        pick.Add(seg);
-        total += seg.Length + 1;
-      }
-      if (pick.Count > 0) break;
-    }
-
-    // Fallback if no overlap
-    if (pick.Count == 0)
-    {
-      var head = string.Concat(snippet.Take(windowChars));
-      return head.Trim();
-    }
-
-    return string.Join(" ", pick).Trim();
+    return veryShort && (endsColon || manyCaps || titleCase || bullet);
   }
+
+  static IReadOnlyList<string> BuildWindows(
+      string query,
+      string snippet,
+      int windows = 2,                 // allow up to 2 windows per chunk
+      int windowChars = 800,           // ~180–220 tokens
+      int minGapChars = 500,           // keep windows apart
+      int earlyHeaderThreshold = 300)  // if top hit is very early, skip to a deeper anchor
+  {
+    if (string.IsNullOrWhiteSpace(snippet)) return Array.Empty<string>();
+
+    var sentences = Regex.Split(snippet, @"(?<=[\.!\?])\s+")
+                         .Select(s => s.Trim())
+                         .Where(s => !string.IsNullOrEmpty(s))
+                         .ToArray();
+
+    // Keyword overlap scoring
+    var qTerms = Regex.Matches(query.ToLowerInvariant(), @"\b[a-z0-9]{3,}\b")
+                      .Select(m => m.Value)
+                      .ToHashSet();
+
+    int CharIndexOfSentence(int idx)
+    {
+      int pos = 0;
+      for (int i = 0; i < idx; i++) pos += sentences[i].Length + 1;
+      return pos;
+    }
+
+    // Score sentences; penalize obvious headers and very-early hits
+    var scored = sentences.Select((s, i) =>
+    {
+      var toks = Regex.Matches(s.ToLowerInvariant(), @"\b[a-z0-9]{3,}\b")
+                      .Select(m => m.Value);
+      int overlap = toks.Count(t => qTerms.Contains(t));
+
+      bool header = IsHeaderLike(s);
+      int charPos = CharIndexOfSentence(i);
+
+      double score = overlap;
+      if (header) score -= 1.0;                            // downweight headers
+      if (charPos < earlyHeaderThreshold) score -= 0.5;    // bias away from very top
+
+      return (i, charPos, score);
+    })
+    .OrderByDescending(x => x.score)
+    .ToList();
+
+    // Greedy selection of anchors (far apart)
+    var anchors = new List<(int i, int pos)>();
+    foreach (var cand in scored)
+    {
+      if (anchors.Count >= windows) break;
+      if (cand.score <= 0 && anchors.Count > 0) break; // no meaningful hits left
+
+      bool farEnough = anchors.All(a => Math.Abs(a.pos - cand.charPos) >= minGapChars);
+      if (farEnough)
+      {
+        // If this anchor is too close to the top and header-ish, try the next best
+        if (cand.charPos < earlyHeaderThreshold && IsHeaderLike(sentences[cand.i]))
+          continue;
+
+        anchors.Add((cand.i, cand.charPos));
+      }
+    }
+
+    // Fallback: if we found nothing, take a mid-chunk slice
+    if (anchors.Count == 0)
+    {
+      int midStart = Math.Max(0, snippet.Length / 2 - windowChars / 2);
+      return new[] { snippet.Substring(midStart, Math.Min(windowChars, snippet.Length - midStart)).Trim() };
+    }
+
+    // Build windows around anchors
+    string SliceAround(int i)
+    {
+      int start = CharIndexOfSentence(i);
+      int left = Math.Max(0, start - windowChars / 3); // slightly above the anchor
+      int len = Math.Min(windowChars, snippet.Length - left);
+      return snippet.Substring(left, len).Trim();
+    }
+
+    var windowsOut = anchors.Select(a => SliceAround(a.i)).ToList();
+
+    // If we only got 1 window and budget allows, add a fallback later window
+    if (windowsOut.Count == 1 && snippet.Length > windowsOut[0].Length + minGapChars)
+    {
+      int altStart = Math.Min(snippet.Length - windowChars, windowsOut[0].Length + minGapChars);
+      if (altStart > 0)
+        windowsOut.Add(snippet.Substring(altStart, Math.Min(windowChars, snippet.Length - altStart)).Trim());
+    }
+
+    return windowsOut;
+  }
+
 
   private static int ScoreSentence(string s, HashSet<string> qTerms)
   {
