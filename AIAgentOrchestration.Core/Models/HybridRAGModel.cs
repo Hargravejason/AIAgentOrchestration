@@ -433,6 +433,124 @@ public class HybridRAGModel
   }
 
   #endregion
+
+  public sealed class Lexicon
+  {
+    // canonical -> regex matchers for surface forms (data-driven: your thesaurus fills these)
+    public Dictionary<string, List<Regex>> PatternsByCanonical { get; init; } = new();
+
+    // canonical -> contrast set id (e.g., "employment_class")
+    public Dictionary<string, string> ContrastSetOfCanonical { get; init; } = new();
+
+    // contrast set id -> members (canonicals) in that set
+    public Dictionary<string, HashSet<string>> MembersBySet { get; init; } = new();
+  }
+
+  public static HashSet<string> CanonicalsInText(string text, Lexicon lex)
+  {
+    var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    if (string.IsNullOrWhiteSpace(text)) return found;
+
+    foreach (var (canonical, patterns) in lex.PatternsByCanonical)
+    {
+      foreach (var rx in patterns)
+      {
+        if (rx.IsMatch(text))
+        {
+          found.Add(canonical);
+          break; // next canonical
+        }
+      }
+    }
+    return found;
+  }
+
+  public sealed record AlignmentWeights(
+    double BoostSame = 0.18,    // small positive nudge if same member appears
+    double PenaltyAlt = 0.22,   // penalty if an alternate appears but primary is absent
+    double BothPresentDamp = 0.10 // dampen when both appear (optional)
+);
+
+  public static double LexicalAlignmentAdjust(
+      string queryText,
+      string chunkText,
+      Lexicon lex,
+      AlignmentWeights w)
+  {
+    var qCans = CanonicalsInText(queryText, lex);
+    if (qCans.Count == 0) return 0;
+
+    var cCans = CanonicalsInText(chunkText, lex);
+    if (cCans.Count == 0) return 0;
+
+    // Group query canonicals by their contrast set
+    var desiredBySet = qCans
+        .Where(c => lex.ContrastSetOfCanonical.ContainsKey(c))
+        .GroupBy(c => lex.ContrastSetOfCanonical[c])
+        .ToDictionary(g => g.Key, g => g.ToHashSet(StringComparer.OrdinalIgnoreCase));
+
+    if (desiredBySet.Count == 0) return 0;
+
+    double adj = 0;
+
+    foreach (var (setId, desiredSet) in desiredBySet)
+    {
+      if (!lex.MembersBySet.TryGetValue(setId, out var members)) continue;
+
+      // What does the chunk mention from this set?
+      var chunkHits = cCans.Where(c => members.Contains(c))
+                           .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+      if (chunkHits.Count == 0) continue;
+
+      // If chunk has the same member(s) as query → boost
+      bool hasSame = chunkHits.Overlaps(desiredSet);
+
+      // If chunk has alternates (members in set but not desired) → penalty
+      bool hasAlternate = chunkHits.Any(c => !desiredSet.Contains(c));
+
+      if (hasSame && hasAlternate)
+      {
+        // Mixed mentions — dampen (optional)
+        adj += w.BoostSame - w.BothPresentDamp;
+      }
+      else if (hasSame)
+      {
+        adj += w.BoostSame;
+      }
+      else if (hasAlternate)
+      {
+        adj -= w.PenaltyAlt;
+      }
+    }
+
+    return adj;
+  }
+
+  static double FusedChunkScore(
+    RetrievedChunk c,
+    bool phraseHit,
+    string userQuery,
+    Lexicon lex,
+    AlignmentWeights aw,
+    double wDense = 0.55,
+    double wBm25 = 0.35,
+    double wPhrase = 0.25,
+    double wTag = 0.15)
+  {
+    var tagPrior = c.IsFaq ? wTag : 0.0;
+
+    var baseScore = wDense * c.DenseScore
+                  + wBm25 * c.BM25
+                  + (phraseHit ? wPhrase : 0.0)
+                  + tagPrior;
+
+    // NEW: data-driven lexical alignment tweak
+    var text = (c.Title ?? "") + " " + (c.Snippet ?? "");
+    var alignAdj = LexicalAlignmentAdjust(userQuery, text, lex, aw);
+
+    return baseScore + alignAdj;
+  }
 }
 
 
@@ -600,3 +718,6 @@ public sealed class ContextPacker
     return hits;
   }
 }
+
+
+
