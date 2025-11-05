@@ -1,6 +1,7 @@
-﻿using System.Text.RegularExpressions;
-using MuPDFCore;
+﻿using MuPDFCore;
 using MuPDFCore.StructuredText;
+using System.Linq;
+using System.Text.RegularExpressions;
 
 
 namespace PdfSkeleton
@@ -104,6 +105,27 @@ namespace PdfSkeleton
 
         using var st = doc.GetStructuredTextPage(p,true, ST_FLAGS);
 
+        // Estimate full page rectangle
+        Rectangle pageRect;
+        var textBlocks = st.StructuredTextBlocks.OfType<MuPDFTextStructuredTextBlock>().ToList();
+        if (textBlocks.Count > 0)
+          pageRect = textBlocks.Select(b => b.BoundingBox).Aggregate((a, b) => Union(new[] { a, b }));
+        else
+          pageRect = new Rectangle(0, 0, 612, 792); // fallback @72dpi (letter size)
+
+        // Prefer: union of all text block rectangles (most accurate)
+        //var textBlocks = st.StructuredTextBlocks
+        //                   .OfType<MuPDFTextStructuredTextBlock>()
+        //                   //.Select(b => b.BoundingBox)
+        //                   .ToList();
+
+
+        //if (textBlocks.Count > 0)
+        //  pageRect = textBlocks.Aggregate((a, b) => Union(new Rectangle[]{ a, b }));
+        //else
+        //  // Fallback if no text blocks — use a standard letter page @72dpi
+        //  pageRect = new Rectangle(0, 0, 612, 792);
+
         // Emit image blocks (IDs + cropped PNG bytes)
         int imgIdx = 0;
         foreach (var block in st.StructuredTextBlocks)
@@ -111,16 +133,17 @@ namespace PdfSkeleton
           if (block is MuPDFImageStructuredTextBlock ib)
           {
             imgIdx++;
-            var imgbytes = RenderRegionAsPng(doc, p, ib.BoundingBox, dpi: 220); // or 200–220 if you prefer
+            var imgbytes = RenderRegionAsjpeg(doc, p, ib.BoundingBox, dpi: 300);
 
-            current.ContentBlocks.Add(new ContentBlock
+            foreach (var b in ProcessImageBlock(
+                         imgbytes,
+                         imageId: $"p{pageNum}_img{imgIdx}",
+                         pageNum: pageNum,
+                         region: ib.BoundingBox,
+                         pageRect: pageRect))
             {
-              Type = BlockType.Image,
-              ImageId = $"p{pageNum}_img{imgIdx}",
-              ImageBytes = imgbytes,
-              Page = pageNum,
-              BlockId = Id("img", pageNum, ib.GetHashCode())
-            });
+              current.ContentBlocks.Add(b);
+            }
           }
         }
 
@@ -386,22 +409,102 @@ namespace PdfSkeleton
       return Math.Max(q.UpperRight.X, q.LowerRight.X);
     }
 
-    private static byte[] RenderRegionAsPng(
-    MuPDFDocument doc,
-    int pageIndex,          // 0-based
-    Rectangle region,       // in page coordinates
-    double dpi = 288        // tweak as desired (72 = 1x)
-)
+    private static byte[] RenderRegionAsjpeg(MuPDFDocument doc,int pageIndex, Rectangle region, double dpi = 288)
     {
       // MuPDFCore uses a "zoom" factor: 72 dpi == 1.0
       double zoom = dpi / 72.0;
 
       using var ms = new MemoryStream();
-      // Write (part of) a page to a stream (PNG):
-      // doc.WriteImage(page, region, zoom, pixelFormat, stream, fileType, includeAnnotations=true)
-      doc.WriteImage(pageIndex, region, zoom, PixelFormats.RGBA, ms, RasterOutputFileTypes.PNG, includeAnnotations: true);
+      doc.WriteImage(pageIndex, region, zoom, PixelFormats.RGB, ms, RasterOutputFileTypes.JPEG, includeAnnotations: true);
       return ms.ToArray();
     }
+    private static string OcrPngBytes(byte[] pngBytes, string lang = "eng")
+    {
+      using var engine = new Tesseract.TesseractEngine(@"Assets/tessdata", lang, Tesseract.EngineMode.LstmOnly);
+      using var pix = Tesseract.Pix.LoadFromMemory(pngBytes);
+      using var page = engine.Process(pix, Tesseract.PageSegMode.Auto);
+      return page.GetText()?.Trim() ?? string.Empty;
+    }
+
+    private IEnumerable<ContentBlock> ProcessImageBlock(byte[] imgBytes, string imageId, int pageNum, Rectangle region, Rectangle pageRect, string ocrLang = "eng")
+    {
+      // thresholds (tweak as needed)
+      const double TINY_AREA_RATIO = 0.05;   // <5% page -> skip OCR
+      const double LARGE_AREA_RATIO = 0.40;   // >=40% page -> attach OCR to the image block
+      const int MIN_CHAR_TEXTY = 80;
+      const int MIN_LINES_TEXTY = 3;
+      const int MIN_WORDS_TEXTY = 12;
+      const double MIN_ALNUM_RATIO = 0.60;
+
+      double areaRatio = RectArea(region) / Math.Max(1.0, RectArea(pageRect));
+
+      // always create the image block
+      var imgBlock = new ContentBlock
+      {
+        Type = BlockType.Image,
+        ImageId = imageId,
+        ImageBytes = imgBytes,
+        Page = pageNum,
+        BlockId = Id("img", pageNum, imageId.GetHashCode())
+      };
+
+      // tiny images → return image only (logos/icons)
+      if (areaRatio < TINY_AREA_RATIO)
+        return new[] { imgBlock };
+
+      // OCR
+      var ocrText = OcrPngBytes(imgBytes, ocrLang);
+      if (!IsTexty(ocrText, MIN_CHAR_TEXTY, MIN_LINES_TEXTY, MIN_WORDS_TEXTY, MIN_ALNUM_RATIO))
+        return new[] { imgBlock }; // not texty → keep image only
+
+      // texty:
+      if (areaRatio >= LARGE_AREA_RATIO)
+      {
+        // large region (full-page scan / big slide): attach text to the image block
+        imgBlock.Text = ocrText;
+        return new[] { imgBlock };
+      }
+      else
+      {
+        // smaller texty region: emit a paragraph linked to the image
+        var para = new ContentBlock
+        {
+          Type = BlockType.Paragraph,
+          Text = ocrText,
+          ImageId = imageId,                    // provenance link
+          Page = pageNum,
+          BlockId = Id("p_ocr", pageNum, ocrText.GetHashCode())
+        };
+        return new[] { imgBlock, para };
+      }
+
+      // ---- local helpers ----
+      static double RectArea(Rectangle r) => Math.Max(0, (r.X1 - r.X0)) * Math.Max(0, (r.Y1 - r.Y0));
+
+      static bool IsTexty(string? text, int minChars, int minLines, int minWords, double minAlnumRatio)
+      {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        var s = text.Trim();
+
+        int charCount = s.Count(c => !char.IsWhiteSpace(c));
+        if (charCount >= minChars) return true;
+
+        int lineCount = s.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length;
+        if (lineCount >= minLines) return true;
+
+        var words = s.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length >= minWords)
+        {
+          int alnum = s.Count(c => char.IsLetterOrDigit(c));
+          double alnumRatio = (double)alnum / Math.Max(1, s.Length);
+          if (alnumRatio >= minAlnumRatio) return true;
+        }
+        return false;
+      }
+    }
+
+
   }
+
 
 }
