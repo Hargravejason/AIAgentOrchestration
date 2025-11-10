@@ -285,76 +285,175 @@ namespace PdfSkeleton
       return v[lo] * (1 - h) + v[hi] * h;
     }
 
-    // ---- Tiny table detector (lines → rows, character X0 bands → columns) ----
     private sealed record TablePlacement(TableBlock Table, Rectangle Area);
 
-    private static List<TablePlacement> DetectTables(MuPDFStructuredTextPage st, MuPdfCoreSkeletonOptions opt)
+    private static List<TablePlacement> DetectTables(
+        MuPDFStructuredTextPage st,
+        MuPdfCoreSkeletonOptions opt,
+        int maxColumns = 10,
+        int minRows = 2,
+        int maxCellChars = 40,           // used for "short-line" density
+        double alignScoreMin = 0.75,     // % of lines that snap to some col band
+        double shortLineFracMin = 0.60   // % of lines <= maxCellChars
+    )
     {
-      // collect line baselines (use Y1 ~ “bottom” in MuPDF coords)
       var lines = st.StructuredTextBlocks
-                    .OfType<MuPDFTextStructuredTextBlock>()
-                    .SelectMany(b => b.Lines)
-                    .OrderBy(l => l.BoundingBox.Y0)
-                    .ToList();
+          .OfType<MuPDFTextStructuredTextBlock>()
+          .SelectMany(b => b.Lines)
+          .Select(l => new { Text = (l.Text ?? string.Empty).Trim(), Box = l.BoundingBox })
+          .Where(x => x.Text.Length > 0)
+          .OrderBy(x => x.Box.Y0).ThenBy(x => x.Box.X0)
+          .ToList();
+
       if (lines.Count == 0) return new();
 
-      // group into row candidates by similar baseline (Y1)
-      var rows = new List<List<MuPDFStructuredTextLine>>();
+      // --- derive dynamic tolerances from page stats ---
+      var lineHeights = lines.Select(x => (double)x.Box.Y1 - x.Box.Y0).Where(h => h > 0.1).ToList();
+      double medH = Median(lineHeights, fallback: 12.0);
+      double rowTol = Math.Max(1.5, 0.5 * medH);         // baseline clustering tol (Y)
+      double colTol = Math.Max(2.0, 0.6 * (0.35 * medH)); // X-band tol; 0.35*H ≈ char width guess
+
+      // --- build row bands (cluster by Y1) ---
+      var rowBands = new List<List<(string Text, Rectangle Box)>>();
       foreach (var ln in lines)
       {
-        var hit = rows.FirstOrDefault(r => Math.Abs(r[0].BoundingBox.Y1 - ln.BoundingBox.Y1) <= opt.TableRowTolerance);
-        if (hit == null) rows.Add(new() { ln }); else hit.Add(ln);
+        var hit = rowBands.FirstOrDefault(r => Math.Abs(r[0].Box.Y1 - ln.Box.Y1) <= rowTol);
+        if (hit == null) rowBands.Add(new() { (ln.Text, ln.Box) });
+        else hit.Add((ln.Text, ln.Box));
       }
 
-      // build column bands from character X0 positions
-      var colEdges = new List<double>();
-      foreach (var ln in lines)
+      // find contiguous sequences of row bands to evaluate as candidate tables
+      var placements = new List<TablePlacement>();
+      int start = 0;
+      while (start < rowBands.Count)
       {
-        foreach (var ch in ln.Characters)
+        int end = start;
+        // grow while next band is close vertically (avoid big gaps)
+        while (end + 1 < rowBands.Count &&
+               Math.Abs(rowBands[end + 1][0].Box.Y0 - rowBands[end][0].Box.Y1) <= 3 * medH)
+          end++;
+
+        int bandCount = end - start + 1;
+        if (bandCount >= minRows)
         {
-          var x = CharLeftX(ch); // left-ish quad vertex
-          if (!colEdges.Any(e => Math.Abs(e - x) <= opt.TableColTolerance))
-            colEdges.Add(x);
+          var blockRows = rowBands.GetRange(start, bandCount);
+          var placement = TryMakeTable(blockRows, maxColumns, colTol, maxCellChars, alignScoreMin, shortLineFracMin);
+          if (placement != null) placements.Add(placement);
         }
-      }
-      colEdges.Sort();
-      if (colEdges.Count < 2 || rows.Count < 2) return new();
 
-      // fill rows → cells
-      var tRows = new List<List<string>>();
-      foreach (var r in rows)
+        start = end + 1;
+      }
+
+      return placements;
+
+      // ---- local helpers ----
+
+      static TablePlacement? TryMakeTable(
+          List<List<(string Text, Rectangle Box)>> rowsGeom,
+          int maxCols,
+          double colTol,
+          int maxCellChars,
+          double alignScoreMin,
+          double shortLineFracMin)
       {
-        // merge the row's lines left-to-right
-        var textPieces = r.Select(x => (x.BoundingBox.X0, x.Text ?? "")).OrderBy(t => t.X0).Select(t => t.Item2).ToArray();
-        var rowText = string.Join(" ", textPieces).Trim();
-        // split into cells by nearest band using characters (more robust than whitespace)
-        var cells = new string[colEdges.Count];
-        Array.Fill(cells, "");
-        foreach (var ln in r)
+        // Build global X bands from all line left edges
+        var xAll = rowsGeom.SelectMany(r => r.Select(c => (double)c.Box.X0))
+                           .OrderBy(x => x).ToList();
+        if (xAll.Count < 4) return null;
+
+        var colCenters = new List<double>();
+        foreach (var x in xAll)
         {
-          foreach (var ch in ln.Characters.OrderBy(c => CharLeftX(c)))
+          if (colCenters.Count == 0 || Math.Abs(colCenters[^1] - x) > colTol)
+            colCenters.Add(x);
+        }
+        if (colCenters.Count < 2 || colCenters.Count > maxCols) return null;
+
+        // Assign each (Text,Box) to nearest col band for each row
+        var tableRows = new List<List<string>>();
+        var perRowNonEmpty = new List<int>();
+        int alignedLines = 0, totalLines = 0;
+        int shortLines = 0, totalCells = 0;
+
+        foreach (var r in rowsGeom)
+        {
+          var sorted = r.OrderBy(c => c.Box.X0).ToList();
+          var cells = Enumerable.Repeat("", colCenters.Count).ToArray();
+
+          foreach (var c in sorted)
           {
-            int idx = NearestIndex(colEdges, CharLeftX(ch));
+            totalLines++;
+            int idx = NearestIndex(colCenters, c.Box.X0);
             if (idx < 0 || idx >= cells.Length) continue;
-            cells[idx] += ch.Character;
+
+            // snap check for alignment score
+            if (Math.Abs(colCenters[idx] - c.Box.X0) <= colTol) alignedLines++;
+
+            if (cells[idx].Length > 0) cells[idx] += " ";
+            cells[idx] += c.Text;
+
+            totalCells++;
+            if (c.Text.Length <= maxCellChars) shortLines++;
           }
+
+          int nn = cells.Count(s => !string.IsNullOrWhiteSpace(s));
+          perRowNonEmpty.Add(nn);
+          tableRows.Add(cells.ToList());
         }
-        // normalize cells
-        for (int i = 0; i < cells.Length; i++) cells[i] = cells[i].Trim();
-        if (cells.Count(c => !string.IsNullOrWhiteSpace(c)) >= 2)
-          tRows.Add(cells.ToList());
+
+        if (totalLines == 0) return null;
+        double alignScore = (double)alignedLines / totalLines;
+        double shortFrac = (double)shortLines / Math.Max(1, totalCells);
+
+        // Column count consistency
+        int modeCols = perRowNonEmpty.GroupBy(x => x).OrderByDescending(g => g.Count()).First().Key;
+        bool consistentCols = perRowNonEmpty.All(c => c == modeCols);
+        bool colsOk = modeCols >= 2 && modeCols <= maxCols;
+
+        // Reject if it doesn't look like a table
+        if (!(alignScore >= alignScoreMin && shortFrac >= shortLineFracMin && consistentCols && colsOk))
+          return null;
+
+        // Rectangularize to modeCols
+        var finalRows = new List<List<string>>();
+        foreach (var r in tableRows)
+        {
+          var v = r;
+          if (v.Count > modeCols) v = v.Take(modeCols).ToList();
+          if (v.Count < modeCols) v.AddRange(Enumerable.Repeat("", modeCols - v.Count));
+          finalRows.Add(v);
+        }
+
+        var tb = new TableBlock();
+        foreach (var row in finalRows) tb.Rows.Add(row);
+
+        // Area = union of all row rectangles
+        var area = rowsGeom.SelectMany(r => r.Select(c => c.Box)).Aggregate((a, b) => Union(new[] { a, b }));
+        return new TablePlacement(tb, area);
       }
-      if (tRows.Count < 2) return new();
 
-      var tb = new TableBlock();
-      foreach (var r in tRows) tb.Rows.Add(r);
+      static int NearestIndex(List<double> sorted, double x)
+      {
+        if (sorted.Count == 0) return -1;
+        int lo = 0, hi = sorted.Count - 1;
+        while (lo < hi)
+        {
+          int mid = (lo + hi) / 2;
+          if (sorted[mid] < x) lo = mid + 1; else hi = mid;
+        }
+        if (lo > 0 && Math.Abs(sorted[lo - 1] - x) <= Math.Abs(sorted[lo] - x)) return lo - 1;
+        return lo;
+      }
 
-      // union area over participating lines
-      var rects = rows.SelectMany(r => r.Select(l => l.BoundingBox));
-      var area = Union(rects);
-
-      return new() { new TablePlacement(tb, area) };
+      static double Median(List<double> v, double fallback)
+      {
+        if (v == null || v.Count == 0) return fallback;
+        v.Sort();
+        int n = v.Count;
+        return (n % 2 == 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+      }
     }
+
 
     private static int NearestIndex(List<double> sorted, double x)
     {
