@@ -19,16 +19,16 @@
 
 using HtmlAgilityPack;
 using IronOcr;
-using IronSoftware.Drawing;
-using System.Text;
-using System.Text.RegularExpressions;
-using static IronOcr.OcrResult;
 using IronPdf;
+using IronSoftware.Drawing;
 using IronSoftware.Drawing; // for Color
-
 using IronWord;
 using IronWord.Models;
 using IronWord.Models.Enums;
+using System.Text;
+using System.Text.RegularExpressions;
+using static HtmlToDocumentModelConverter;
+using static IronOcr.OcrResult;
 
 namespace PdfSkeletonIronOcr
 {
@@ -604,247 +604,260 @@ public class IronPdfDocumentWriter : IDocumentWriter<PdfDocument>
   private readonly double _pageWidth;
   private readonly double _pageHeight;
   private readonly double _marginLeft;
+  private readonly double _marginRight;
   private readonly double _marginTop;
   private readonly double _marginBottom;
   private readonly string _fontName;
 
   // basic layout config
   public IronPdfDocumentWriter(
-      double pageWidth = 595,   // A4 width in points
-      double pageHeight = 842,  // A4 height in points
-      double marginLeft = 50,
-      double marginTop = 50,
-      double marginBottom = 50,
-      string fontName = "Arial")
+        double pageWidth = 210,   // e.g. A4 width (mm or whatever unit IronPdf is using)
+        double pageHeight = 297,  // e.g. A4 height
+        double marginLeft = 20,
+        double marginRight = 20,
+        double marginTop = 20,
+        double marginBottom = 20,
+        string fontName = "Arial")
   {
     _pageWidth = pageWidth;
     _pageHeight = pageHeight;
     _marginLeft = marginLeft;
+    _marginRight = marginRight;
     _marginTop = marginTop;
     _marginBottom = marginBottom;
     _fontName = fontName;
   }
 
-  public PdfDocument Write(HtmlToDocumentModelConverter.DocumentModel model)
+  public PdfDocument Write(DocumentModel model)
   {
-    // create blank PDF with one page
+    if (model == null) throw new ArgumentNullException(nameof(model));
+
     var pdf = new PdfDocument(_pageWidth, _pageHeight);
 
-    int pageIndex = 0;
-    double cursorX = _marginLeft;
-    double cursorY = _marginTop;
-    double lineSpacing = 16; // base line spacing (for body text)
+    // Remove the auto-created blank page so we control everything
+    pdf.Pages.Clear();
+
+    // Start with first page
+    int pageIndex = pdf.AddPage(_pageWidth, _pageHeight);
+
+    // cursorYTop = distance from the *top* margin going downward
+    double cursorYTop = _marginTop;
 
     foreach (var block in model.Blocks)
     {
       switch (block)
       {
-        case HtmlToDocumentModelConverter.HeadingBlock h:
-          (pageIndex, cursorY) = WriteHeading(pdf, pageIndex, cursorX, cursorY, h);
-          cursorY += lineSpacing; // space after heading
+        case HeadingBlock heading:
+          WriteHeading(pdf, ref pageIndex, ref cursorYTop, heading);
           break;
 
-        case HtmlToDocumentModelConverter.ParagraphBlock p:
-          (pageIndex, cursorY) = WriteParagraph(pdf, pageIndex, cursorX, cursorY, p, 12);
-          cursorY += lineSpacing;
+        case ParagraphBlock paragraph when block is not HeadingBlock:
+          WriteParagraph(pdf, ref pageIndex, ref cursorYTop, paragraph);
           break;
 
-        case HtmlToDocumentModelConverter.ListBlock list:
-          (pageIndex, cursorY) = WriteList(pdf, pageIndex, cursorX, cursorY, list, 12);
-          cursorY += lineSpacing;
+        case ListBlock list:
+          WriteList(pdf, ref pageIndex, ref cursorYTop, list);
           break;
-      }
-
-      // page break if we’re too low
-      if (cursorY > _pageHeight - _marginBottom)
-      {
-        pdf.AddPage(_pageWidth, _pageHeight); // adds a new page
-        pageIndex++;
-        cursorY = _marginTop;
       }
     }
 
     return pdf;
   }
 
-  private (int pageIndex, double cursorY) WriteHeading(
+  // ------------------ helpers ------------------
+
+  private void EnsureSpaceOrNewPage(
       PdfDocument pdf,
-      int pageIndex,
-      double x,
-      double cursorY,
-      HtmlToDocumentModelConverter.HeadingBlock h)
+      ref int pageIndex,
+      ref double cursorYTop,
+      double neededHeight)
   {
-    double fontSize = h.Level switch
+    // If writing this block would go past the bottom margin, start a new page
+    if (cursorYTop + neededHeight > _pageHeight - _marginBottom)
+    {
+      pageIndex = pdf.AddPage(_pageWidth, _pageHeight);
+      cursorYTop = _marginTop;
+    }
+  }
+
+  private static IEnumerable<string> WrapText(string text, int maxCharsPerLine)
+  {
+    if (string.IsNullOrWhiteSpace(text))
+      yield break;
+
+    var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+    var line = new StringBuilder();
+
+    foreach (var word in words)
+    {
+      if (line.Length + word.Length + (line.Length > 0 ? 1 : 0) > maxCharsPerLine)
+      {
+        if (line.Length > 0)
+        {
+          yield return line.ToString();
+          line.Clear();
+        }
+      }
+
+      if (line.Length > 0)
+        line.Append(' ');
+
+      line.Append(word);
+    }
+
+    if (line.Length > 0)
+      yield return line.ToString();
+  }
+
+  private double ToPdfY(double cursorYTop, double lineHeight)
+  {
+    // Convert "distance from top" to "distance from bottom" (baseline)
+    // pdfY = pageHeight - (topOffset + lineHeight)
+    return _pageHeight - cursorYTop - lineHeight;
+  }
+
+  // ------------------ block writers ------------------
+
+  private void WriteHeading(
+      PdfDocument pdf,
+      ref int pageIndex,
+      ref double cursorYTop,
+      HeadingBlock heading)
+  {
+    double fontSize = heading.Level switch
     {
       1 => 22,
       2 => 18,
       3 => 16,
       _ => 14
     };
+    double lineHeight = fontSize + 4;
 
-    var text = string.Concat(h.Inlines.OfType<HtmlToDocumentModelConverter.TextRunInline>().Select(r => r.Text));
-    var lines = TextWrapper.WrapText(text, maxCharsPerLine: 60).ToList();
-    var lineHeight = fontSize + 4;
+    var text = string.Concat(heading.Inlines.OfType<TextRunInline>().Select(r => r.Text));
+    var lines = WrapText(text, maxCharsPerLine: 60).ToList();
+
+    double totalHeight = lines.Count * lineHeight;
+    EnsureSpaceOrNewPage(pdf, ref pageIndex, ref cursorYTop, totalHeight);
 
     foreach (var line in lines)
     {
-      if (cursorY > _pageHeight - _marginBottom)
-      {
-        pdf.AddPage(_pageWidth, _pageHeight);
-        pageIndex++;
-        cursorY = _marginTop;
-      }
+      var pdfY = ToPdfY(cursorYTop, lineHeight);
 
       pdf.DrawText(
           line,
           _fontName,
           fontSize,
           pageIndex,
-          x,
-          cursorY,
+          _marginLeft,
+          pdfY,
           IronSoftware.Drawing.Color.Black,
           0);
 
-      cursorY += lineHeight;
+      cursorYTop += lineHeight;
     }
 
-    return (pageIndex, cursorY);
+    // extra space after heading
+    cursorYTop += 4;
   }
 
-  private (int pageIndex, double cursorY) WriteParagraph(
+  private void WriteParagraph(
       PdfDocument pdf,
-      int pageIndex,
-      double x,
-      double cursorY,
-      HtmlToDocumentModelConverter.ParagraphBlock p,
-      double fontSize)
+      ref int pageIndex,
+      ref double cursorYTop,
+      ParagraphBlock paragraph)
   {
-    var text = string.Concat(p.Inlines.OfType<HtmlToDocumentModelConverter.TextRunInline>().Select(r => r.Text));
-    var maxChars = 80;
-    var lines = TextWrapper.WrapText(text, maxChars).ToList();
-    var lineHeight = fontSize + 4;
+    double fontSize = 12;
+    double lineHeight = fontSize + 4;
+
+    var text = string.Concat(paragraph.Inlines.OfType<TextRunInline>().Select(r => r.Text));
+    var lines = WrapText(text, maxCharsPerLine: 80).ToList();
+
+    double totalHeight = lines.Count * lineHeight;
+    EnsureSpaceOrNewPage(pdf, ref pageIndex, ref cursorYTop, totalHeight);
 
     foreach (var line in lines)
     {
-      if (cursorY > _pageHeight - _marginBottom)
-      {
-        pdf.AddPage(_pageWidth, _pageHeight);
-        pageIndex++;
-        cursorY = _marginTop;
-      }
+      var pdfY = ToPdfY(cursorYTop, lineHeight);
 
       pdf.DrawText(
           line,
           _fontName,
           fontSize,
           pageIndex,
-          x,
-          cursorY,
+          _marginLeft,
+          pdfY,
           IronSoftware.Drawing.Color.Black,
           0);
 
-      cursorY += lineHeight;
+      cursorYTop += lineHeight;
     }
 
-    return (pageIndex, cursorY);
+    cursorYTop += 4; // spacing after paragraph
   }
 
-  private (int pageIndex, double cursorY) WriteList(
+  private void WriteList(
       PdfDocument pdf,
-      int pageIndex,
-      double x,
-      double cursorY,
-      HtmlToDocumentModelConverter.ListBlock list,
-      double fontSize)
+      ref int pageIndex,
+      ref double cursorYTop,
+      ListBlock list)
   {
-    var bulletIndent = 15.0;
-    var textIndent = 30.0;
-    var lineHeight = fontSize + 4;
+    double fontSize = 12;
+    double lineHeight = fontSize + 4;
+    double bulletIndent = 10.0;
+    double textIndent = 20.0;
+
     int index = 1;
 
     foreach (var item in list.Items)
     {
-      var text = string.Concat(item.Inlines.OfType<HtmlToDocumentModelConverter.TextRunInline>().Select(r => r.Text));
-      var prefix = list.Ordered ? $"{index}." : "•";
+      var text = string.Concat(item.Inlines.OfType<TextRunInline>().Select(r => r.Text));
+      var lines = WrapText(text, maxCharsPerLine: 70).ToList();
+      double totalHeight = lines.Count * lineHeight;
 
-      var maxChars = 70;
-      var lines = TextWrapper.WrapText(text, maxChars).ToList();
+      EnsureSpaceOrNewPage(pdf, ref pageIndex, ref cursorYTop, totalHeight);
 
-      foreach (var (line, lineIdx) in lines.Select((l, i) => (l, i)))
+      string bullet = list.Ordered ? $"{index}." : "•";
+
+      for (int i = 0; i < lines.Count; i++)
       {
-        if (cursorY > _pageHeight - _marginBottom)
-        {
-          pdf.AddPage(_pageWidth, _pageHeight);
-          pageIndex++;
-          cursorY = _marginTop;
-        }
+        var line = lines[i];
+        var pdfY = ToPdfY(cursorYTop, lineHeight);
 
-        if (lineIdx == 0)
+        if (i == 0)
         {
-          // bullet / number
+          // draw bullet/number
           pdf.DrawText(
-              prefix,
+              bullet,
               _fontName,
               fontSize,
               pageIndex,
-              x,
-              cursorY,
+              _marginLeft + bulletIndent,
+              pdfY,
               IronSoftware.Drawing.Color.Black,
               0);
         }
 
+        // draw text
         pdf.DrawText(
             line,
             _fontName,
             fontSize,
             pageIndex,
-            x + textIndent,
-            cursorY,
+            _marginLeft + textIndent,
+            pdfY,
             IronSoftware.Drawing.Color.Black,
             0);
 
-        cursorY += lineHeight;
+        cursorYTop += lineHeight;
       }
 
       index++;
     }
 
-    return (pageIndex, cursorY);
+    cursorYTop += 4; // spacing after list
   }
-
-  public static class TextWrapper
-  {
-    public static IEnumerable<string> WrapText(string text, int maxCharsPerLine)
-    {
-      if (string.IsNullOrWhiteSpace(text))
-        yield break;
-
-      var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-      var line = new StringBuilder();
-
-      foreach (var word in words)
-      {
-        if (line.Length + word.Length + 1 > maxCharsPerLine)
-        {
-          if (line.Length > 0)
-          {
-            yield return line.ToString();
-            line.Clear();
-          }
-        }
-
-        if (line.Length > 0)
-          line.Append(' ');
-
-        line.Append(word);
-      }
-
-      if (line.Length > 0)
-        yield return line.ToString();
-    }
-  }
-
 }
+
 public static class PdfExtensions
 {
   /// <summary>
@@ -987,7 +1000,7 @@ public class IronWordWriter : IDocumentWriter<WordDocument>
         paragraph.AddText(textContent);
       }
 
-      var listItem = new ListItem(paragraph);
+      var listItem = new IronWord.Models.ListItem(paragraph);
       textList.AddItem(listItem);
 
       index++;
