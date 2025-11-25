@@ -17,13 +17,18 @@
 //   var parser = new PdfSkeletonIronOcr.Parser(pageImageProvider: (pageIndex) => MyGetImages(pageIndex));
 //   // pageImageProvider returns a list of (Bounds, Bytes) for that page.
 
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Text.RegularExpressions;
+using HtmlAgilityPack;
 using IronOcr;
 using IronSoftware.Drawing;
+using System.Text;
+using System.Text.RegularExpressions;
+using static IronOcr.OcrResult;
+using IronPdf;
+using IronSoftware.Drawing; // for Color
+
+using IronWord;
+using IronWord.Models;
+using IronWord.Models.Enums;
 
 namespace PdfSkeletonIronOcr
 {
@@ -401,6 +406,661 @@ namespace PdfSkeletonIronOcr
       }
       if (lo > 0 && Math.Abs(sorted[lo - 1] - x) <= Math.Abs(sorted[lo] - x)) return lo - 1;
       return lo;
+    }
+  }
+}
+
+
+
+public class HtmlToDocumentModelConverter
+{
+  public DocumentModel Convert(string html)
+  {
+    var hap = new HtmlDocument();
+    hap.LoadHtml(html);
+
+    var model = new DocumentModel();
+    var root = hap.DocumentNode.SelectSingleNode("//body") ?? hap.DocumentNode;
+
+    foreach (var child in root.ChildNodes)
+    {
+      ProcessBlockNode(child, model.Blocks);
+    }
+
+    return model;
+  }
+
+  private void ProcessBlockNode(HtmlNode node, List<Block> blocks)
+  {
+    if (node.NodeType == HtmlNodeType.Text)
+    {
+      var text = node.InnerText.Trim();
+      if (!string.IsNullOrEmpty(text))
+      {
+        var p = new ParagraphBlock();
+        p.Inlines.Add(new TextRunInline { Text = text });
+        blocks.Add(p);
+      }
+      return;
+    }
+
+    if (node.NodeType != HtmlNodeType.Element)
+      return;
+
+    switch (node.Name.ToLowerInvariant())
+    {
+      case "h1":
+      case "h2":
+      case "h3":
+      case "h4":
+      case "h5":
+      case "h6":
+        blocks.Add(CreateHeadingBlock(node));
+        break;
+
+      case "p":
+      case "div":
+        blocks.Add(CreateParagraphBlock(node));
+        break;
+
+      case "ul":
+      case "ol":
+        blocks.Add(CreateListBlock(node));
+        break;
+
+      default:
+        // recurse into children for unknown containers
+        foreach (var child in node.ChildNodes)
+          ProcessBlockNode(child, blocks);
+        break;
+    }
+  }
+
+  private HeadingBlock CreateHeadingBlock(HtmlNode node)
+  {
+    var h = new HeadingBlock
+    {
+      Level = int.Parse(node.Name.Substring(1, 1))
+    };
+    ProcessInlineChildren(node, h.Inlines, bold: true, italic: false, underline: false);
+    return h;
+  }
+
+  private ParagraphBlock CreateParagraphBlock(HtmlNode node)
+  {
+    var p = new ParagraphBlock();
+    ProcessInlineChildren(node, p.Inlines, bold: false, italic: false, underline: false);
+    return p;
+  }
+
+  private ListBlock CreateListBlock(HtmlNode node)
+  {
+    var ordered = node.Name.Equals("ol", StringComparison.OrdinalIgnoreCase);
+    var list = new ListBlock { Ordered = ordered };
+
+    foreach (var li in node.Elements("li"))
+    {
+      var item = new ListItem();
+      ProcessInlineChildren(li, item.Inlines, bold: false, italic: false, underline: false);
+      list.Items.Add(item);
+    }
+
+    return list;
+  }
+
+  private void ProcessInlineChildren(
+      HtmlNode node,
+      List<Inline> inlines,
+      bool bold,
+      bool italic,
+      bool underline)
+  {
+    foreach (var child in node.ChildNodes)
+    {
+      if (child.NodeType == HtmlNodeType.Text)
+      {
+        var text = HtmlEntity.DeEntitize(child.InnerText);
+        if (!string.IsNullOrWhiteSpace(text))
+        {
+          inlines.Add(new TextRunInline
+          {
+            Text = text,
+            Bold = bold,
+            Italic = italic,
+            Underline = underline
+          });
+        }
+      }
+      else if (child.NodeType == HtmlNodeType.Element)
+      {
+        var tag = child.Name.ToLowerInvariant();
+        var b = bold;
+        var i = italic;
+        var u = underline;
+
+        switch (tag)
+        {
+          case "b":
+          case "strong": b = true; break;
+          case "i":
+          case "em": i = true; break;
+          case "u": u = true; break;
+        }
+
+        ProcessInlineChildren(child, inlines, b, i, u);
+      }
+    }
+  }
+
+
+  public class DocumentModel
+  {
+    public List<Block> Blocks { get; set; } = new();
+  }
+
+  public abstract class Block { }
+
+  public class ParagraphBlock : Block
+  {
+    public List<Inline> Inlines { get; set; } = new();
+  }
+
+  public class HeadingBlock : ParagraphBlock
+  {
+    public int Level { get; set; } // 1–6
+  }
+
+  public class ListBlock : Block
+  {
+    public bool Ordered { get; set; }
+    public List<ListItem> Items { get; set; } = new();
+  }
+
+  public class ListItem
+  {
+    public List<Inline> Inlines { get; set; } = new();
+  }
+
+  public abstract class Inline { }
+
+  public class TextRunInline : Inline
+  {
+    public string Text { get; set; } = string.Empty;
+    public bool Bold { get; set; }
+    public bool Italic { get; set; }
+    public bool Underline { get; set; }
+  }
+}
+
+
+
+public interface IDocumentWriter<TOutput>
+{
+  TOutput Write(HtmlToDocumentModelConverter.DocumentModel model);
+}
+
+public class IronPdfDocumentWriter : IDocumentWriter<PdfDocument>
+{
+  private readonly double _pageWidth;
+  private readonly double _pageHeight;
+  private readonly double _marginLeft;
+  private readonly double _marginTop;
+  private readonly double _marginBottom;
+  private readonly string _fontName;
+
+  // basic layout config
+  public IronPdfDocumentWriter(
+      double pageWidth = 595,   // A4 width in points
+      double pageHeight = 842,  // A4 height in points
+      double marginLeft = 50,
+      double marginTop = 50,
+      double marginBottom = 50,
+      string fontName = "Arial")
+  {
+    _pageWidth = pageWidth;
+    _pageHeight = pageHeight;
+    _marginLeft = marginLeft;
+    _marginTop = marginTop;
+    _marginBottom = marginBottom;
+    _fontName = fontName;
+  }
+
+  public PdfDocument Write(HtmlToDocumentModelConverter.DocumentModel model)
+  {
+    // create blank PDF with one page
+    var pdf = new PdfDocument(_pageWidth, _pageHeight);
+
+    int pageIndex = 0;
+    double cursorX = _marginLeft;
+    double cursorY = _marginTop;
+    double lineSpacing = 16; // base line spacing (for body text)
+
+    foreach (var block in model.Blocks)
+    {
+      switch (block)
+      {
+        case HtmlToDocumentModelConverter.HeadingBlock h:
+          (pageIndex, cursorY) = WriteHeading(pdf, pageIndex, cursorX, cursorY, h);
+          cursorY += lineSpacing; // space after heading
+          break;
+
+        case HtmlToDocumentModelConverter.ParagraphBlock p:
+          (pageIndex, cursorY) = WriteParagraph(pdf, pageIndex, cursorX, cursorY, p, 12);
+          cursorY += lineSpacing;
+          break;
+
+        case HtmlToDocumentModelConverter.ListBlock list:
+          (pageIndex, cursorY) = WriteList(pdf, pageIndex, cursorX, cursorY, list, 12);
+          cursorY += lineSpacing;
+          break;
+      }
+
+      // page break if we’re too low
+      if (cursorY > _pageHeight - _marginBottom)
+      {
+        pdf.AddPage(_pageWidth, _pageHeight); // adds a new page
+        pageIndex++;
+        cursorY = _marginTop;
+      }
+    }
+
+    return pdf;
+  }
+
+  private (int pageIndex, double cursorY) WriteHeading(
+      PdfDocument pdf,
+      int pageIndex,
+      double x,
+      double cursorY,
+      HtmlToDocumentModelConverter.HeadingBlock h)
+  {
+    double fontSize = h.Level switch
+    {
+      1 => 22,
+      2 => 18,
+      3 => 16,
+      _ => 14
+    };
+
+    var text = string.Concat(h.Inlines.OfType<HtmlToDocumentModelConverter.TextRunInline>().Select(r => r.Text));
+    var lines = TextWrapper.WrapText(text, maxCharsPerLine: 60).ToList();
+    var lineHeight = fontSize + 4;
+
+    foreach (var line in lines)
+    {
+      if (cursorY > _pageHeight - _marginBottom)
+      {
+        pdf.AddPage(_pageWidth, _pageHeight);
+        pageIndex++;
+        cursorY = _marginTop;
+      }
+
+      pdf.DrawText(
+          line,
+          _fontName,
+          fontSize,
+          pageIndex,
+          x,
+          cursorY,
+          IronSoftware.Drawing.Color.Black,
+          0);
+
+      cursorY += lineHeight;
+    }
+
+    return (pageIndex, cursorY);
+  }
+
+  private (int pageIndex, double cursorY) WriteParagraph(
+      PdfDocument pdf,
+      int pageIndex,
+      double x,
+      double cursorY,
+      HtmlToDocumentModelConverter.ParagraphBlock p,
+      double fontSize)
+  {
+    var text = string.Concat(p.Inlines.OfType<HtmlToDocumentModelConverter.TextRunInline>().Select(r => r.Text));
+    var maxChars = 80;
+    var lines = TextWrapper.WrapText(text, maxChars).ToList();
+    var lineHeight = fontSize + 4;
+
+    foreach (var line in lines)
+    {
+      if (cursorY > _pageHeight - _marginBottom)
+      {
+        pdf.AddPage(_pageWidth, _pageHeight);
+        pageIndex++;
+        cursorY = _marginTop;
+      }
+
+      pdf.DrawText(
+          line,
+          _fontName,
+          fontSize,
+          pageIndex,
+          x,
+          cursorY,
+          IronSoftware.Drawing.Color.Black,
+          0);
+
+      cursorY += lineHeight;
+    }
+
+    return (pageIndex, cursorY);
+  }
+
+  private (int pageIndex, double cursorY) WriteList(
+      PdfDocument pdf,
+      int pageIndex,
+      double x,
+      double cursorY,
+      HtmlToDocumentModelConverter.ListBlock list,
+      double fontSize)
+  {
+    var bulletIndent = 15.0;
+    var textIndent = 30.0;
+    var lineHeight = fontSize + 4;
+    int index = 1;
+
+    foreach (var item in list.Items)
+    {
+      var text = string.Concat(item.Inlines.OfType<HtmlToDocumentModelConverter.TextRunInline>().Select(r => r.Text));
+      var prefix = list.Ordered ? $"{index}." : "•";
+
+      var maxChars = 70;
+      var lines = TextWrapper.WrapText(text, maxChars).ToList();
+
+      foreach (var (line, lineIdx) in lines.Select((l, i) => (l, i)))
+      {
+        if (cursorY > _pageHeight - _marginBottom)
+        {
+          pdf.AddPage(_pageWidth, _pageHeight);
+          pageIndex++;
+          cursorY = _marginTop;
+        }
+
+        if (lineIdx == 0)
+        {
+          // bullet / number
+          pdf.DrawText(
+              prefix,
+              _fontName,
+              fontSize,
+              pageIndex,
+              x,
+              cursorY,
+              IronSoftware.Drawing.Color.Black,
+              0);
+        }
+
+        pdf.DrawText(
+            line,
+            _fontName,
+            fontSize,
+            pageIndex,
+            x + textIndent,
+            cursorY,
+            IronSoftware.Drawing.Color.Black,
+            0);
+
+        cursorY += lineHeight;
+      }
+
+      index++;
+    }
+
+    return (pageIndex, cursorY);
+  }
+
+  public static class TextWrapper
+  {
+    public static IEnumerable<string> WrapText(string text, int maxCharsPerLine)
+    {
+      if (string.IsNullOrWhiteSpace(text))
+        yield break;
+
+      var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+      var line = new StringBuilder();
+
+      foreach (var word in words)
+      {
+        if (line.Length + word.Length + 1 > maxCharsPerLine)
+        {
+          if (line.Length > 0)
+          {
+            yield return line.ToString();
+            line.Clear();
+          }
+        }
+
+        if (line.Length > 0)
+          line.Append(' ');
+
+        line.Append(word);
+      }
+
+      if (line.Length > 0)
+        yield return line.ToString();
+    }
+  }
+
+}
+public static class PdfExtensions
+{
+  /// <summary>
+  /// Adds a new blank page to the document and returns its page index.
+  /// </summary>
+  public static int AddPage(this PdfDocument doc, double widthMm, double heightMm)
+  {
+    var newPage = new IronPdf.Pages.PdfPage(widthMm, heightMm);
+    doc.Pages.Add(newPage);
+    return doc.PageCount - 1; // index of the page we just added
+  }
+}
+
+
+
+public class IronWordWriter : IDocumentWriter<WordDocument>
+{
+  // You can pass defaults in via constructor later if you want
+  private readonly string _defaultFontFamily;
+  private readonly float _defaultFontSize;
+
+  public IronWordWriter(
+      string defaultFontFamily = "Calibri",
+      float defaultFontSize = 11)
+  {
+    _defaultFontFamily = defaultFontFamily;
+    _defaultFontSize = defaultFontSize;
+  }
+
+  public WordDocument Write(HtmlToDocumentModelConverter.DocumentModel model)
+  {
+    if (model == null) throw new ArgumentNullException(nameof(model));
+
+    var doc = new WordDocument(); // new blank document 
+
+    foreach (var block in model.Blocks)
+    {
+      switch (block)
+      {
+        case HtmlToDocumentModelConverter.HeadingBlock heading:
+          AddHeading(doc, heading);
+          break;
+
+        case HtmlToDocumentModelConverter.ParagraphBlock paragraph when block is not HtmlToDocumentModelConverter.HeadingBlock:
+          AddParagraph(doc, paragraph);
+          break;
+
+        case HtmlToDocumentModelConverter.ListBlock list:
+          AddList(doc, list);
+          break;
+
+          // TableBlock etc. can be added later
+      }
+    }
+
+    return doc;
+  }
+
+  // ---------- Headings ----------
+
+  private void AddHeading(WordDocument doc, HtmlToDocumentModelConverter.HeadingBlock heading)
+  {
+    // Map H1–H6 to font sizes
+    float size = heading.Level switch
+    {
+      1 => 24,
+      2 => 20,
+      3 => 16,
+      4 => 14,
+      5 => 13,
+      _ => 12
+    };
+
+    var paragraph = new IronWord.Models.Paragraph();
+
+    foreach (var inline in heading.Inlines.OfType<HtmlToDocumentModelConverter.TextRunInline>())
+    {
+      var textContent = CreateTextContentFromInline(
+          inline,
+          fontSizeOverride: size,
+          forceBold: true // headings are always at least bold
+      );
+
+      paragraph.AddText(textContent); // Add text to paragraph 
+    }
+
+    doc.AddParagraph(paragraph); // Add paragraph to document 
+  }
+
+  // ---------- Normal paragraphs ----------
+
+  private void AddParagraph(WordDocument doc, HtmlToDocumentModelConverter.ParagraphBlock paragraphBlock)
+  {
+    var paragraph = new IronWord.Models.Paragraph();
+
+    foreach (var inline in paragraphBlock.Inlines.OfType<HtmlToDocumentModelConverter.TextRunInline>())
+    {
+      var textContent = CreateTextContentFromInline(inline);
+      paragraph.AddText(textContent);
+    }
+
+    doc.AddParagraph(paragraph);
+  }
+
+  // ---------- Lists (unordered / ordered) ----------
+
+  private void AddList(WordDocument doc, HtmlToDocumentModelConverter.ListBlock listBlock)
+  {
+    // We’ll use MultiLevelTextList + ListItem as in IronWord’s Add List example 
+    var textList = new MultiLevelTextList();
+
+    int index = 1;
+    foreach (var item in listBlock.Items)
+    {
+      var paragraph = new IronWord.Models.Paragraph();
+
+      // If ordered, we can optionally prepend numbers into the text itself.
+      // Word’s actual numbering formatting can be applied later if needed.
+      string numberPrefix = listBlock.Ordered ? $"{index}. " : string.Empty;
+
+      bool isFirstRun = true;
+      foreach (var inline in item.Inlines.OfType<HtmlToDocumentModelConverter.TextRunInline>())
+      {
+        var textRun = inline;
+
+        // Prepend numbering only once per item
+        if (isFirstRun && !string.IsNullOrEmpty(numberPrefix))
+        {
+          textRun = new HtmlToDocumentModelConverter.TextRunInline
+          {
+            Text = numberPrefix + inline.Text,
+            Bold = inline.Bold,
+            Italic = inline.Italic,
+            Underline = inline.Underline
+          };
+          isFirstRun = false;
+        }
+
+        var textContent = CreateTextContentFromInline(textRun);
+        paragraph.AddText(textContent);
+      }
+
+      var listItem = new ListItem(paragraph);
+      textList.AddItem(listItem);
+
+      index++;
+    }
+
+    doc.AddMultiLevelTextList(textList);
+  }
+
+  // ---------- Helper: map TextRunInline -> TextContent + TextStyle ----------
+
+  private TextContent CreateTextContentFromInline(
+      HtmlToDocumentModelConverter.TextRunInline inline,
+      float? fontSizeOverride = null,
+      bool forceBold = false)
+  {
+    var text = new TextContent
+    {
+      Text = inline.Text ?? string.Empty
+    };
+
+    // Build a TextStyle only if we need it
+    var style = new TextStyle
+    {
+      TextFont = new IronWord.Models.Font
+      {
+        FontFamily = _defaultFontFamily,
+        FontSize = fontSizeOverride ?? _defaultFontSize
+      },
+      IsBold = inline.Bold || forceBold,
+      IsItalic = inline.Italic,
+    };
+
+    if (inline.Underline)
+    {
+      style.Underline = new Underline(); // default underline style 
+    }
+
+    // If nothing special, you *could* leave Style null,
+    // but it's fine to always set it for consistency.
+    text.Style = style;
+
+    return text;
+  }
+
+  public static class TextWrapper
+  {
+    public static IEnumerable<string> WrapText(string text, int maxCharsPerLine)
+    {
+      if (string.IsNullOrWhiteSpace(text))
+        yield break;
+
+      var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+      var line = new StringBuilder();
+
+      foreach (var word in words)
+      {
+        if (line.Length + word.Length + 1 > maxCharsPerLine)
+        {
+          if (line.Length > 0)
+          {
+            yield return line.ToString();
+            line.Clear();
+          }
+        }
+
+        if (line.Length > 0)
+          line.Append(' ');
+
+        line.Append(word);
+      }
+
+      if (line.Length > 0)
+        yield return line.ToString();
     }
   }
 }
